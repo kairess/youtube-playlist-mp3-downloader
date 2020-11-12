@@ -1,3 +1,4 @@
 youtube-dl
 pafy
 pydub
+tqdm
