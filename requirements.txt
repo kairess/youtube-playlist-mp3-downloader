@@ -1,0 +1,3 @@
+youtube-dl
+pafy
+python-vlc
