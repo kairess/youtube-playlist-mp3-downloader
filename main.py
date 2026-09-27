@@ -81,8 +81,28 @@ def download_audio_file(video_url, title_hint=''):
             filepath = os.path.join(webm_dir, matches[0])
         return info.get('title') or title_hint or info.get('id'), filepath
 
-def download_and_trim(entry):
-    '''영상을 다운로드하고 앞뒤 무음을 트림한 AudioSegment를 반환한다.'''
+def ask_trim_seconds():
+    '''인트로/아웃트로로 잘라낼 앞/뒤 초를 입력받는다.'''
+    def ask(prompt):
+        value = input(prompt).strip()
+        if not value:
+            return 0.0
+        try:
+            seconds = float(value)
+        except ValueError:
+            print('[!] 잘못된 입력입니다. 0초로 처리합니다.')
+            return 0.0
+        if seconds < 0:
+            print('[!] 음수는 사용할 수 없습니다. 0초로 처리합니다.')
+            return 0.0
+        return seconds
+
+    start_sec = ask('앞부분을 몇 초 잘라낼까요? (건너뛰려면 Enter): ')
+    end_sec = ask('뒷부분을 몇 초 잘라낼까요? (건너뛰려면 Enter): ')
+    return start_sec, end_sec
+
+def download_and_trim(entry, skip_start_sec=0.0, skip_end_sec=0.0):
+    '''영상을 다운로드하고 지정된 인트로/아웃트로를 잘라낸 뒤 앞뒤 무음을 트림한 AudioSegment를 반환한다.'''
     video_url = entry.get('url') or entry.get('webpage_url') or entry.get('id')
     if video_url and not video_url.startswith('http'):
         video_url = 'https://www.youtube.com/watch?v=%s' % video_url
@@ -92,12 +112,20 @@ def download_and_trim(entry):
     title = sanitize_filename(title)
 
     sound = AudioSegment.from_file(filepath)
+
+    start_ms = int(skip_start_sec * 1000)
+    end_ms = int(skip_end_sec * 1000)
+    if start_ms + end_ms < len(sound):
+        sound = sound[start_ms:len(sound) - end_ms]
+    elif verbose:
+        print('[.] 잘라낼 길이가 영상 길이보다 길어 건너뛰기를 생략합니다: %s' % title)
+
     return title, trim_silence(sound)
 
-def download_and_convert(entry):
+def download_and_convert(entry, skip_start_sec=0.0, skip_end_sec=0.0):
     '''비디오를 다운로드하고 개별 MP3로 저장한다.'''
     try:
-        title, trimmed_sound = download_and_trim(entry)
+        title, trimmed_sound = download_and_trim(entry, skip_start_sec, skip_end_sec)
         mp3_path = os.path.join(mp3_dir, title + '.mp3')
         trimmed_sound.export(mp3_path, format='mp3', bitrate='192k')
         print('[+] 성공적으로 다운로드: %s' % title)
@@ -106,14 +134,57 @@ def download_and_convert(entry):
         print('[!] 오류 발생: %s - %s' % (entry.get('title', 'unknown'), e))
         return False
 
-def download_playlist_merged(playlist_title, entries):
+def choose_first_entry(entries):
+    '''사용자가 제목 일부를 입력해 1번으로 재생할 곡을 선택하면 해당 곡을 맨 앞으로 옮긴 목록을 반환한다.'''
+    keyword = input('1번으로 재생할 곡의 제목 일부를 입력하세요 (건너뛰려면 Enter): ').strip()
+    if not keyword:
+        return entries
+
+    keyword_lower = keyword.lower()
+    matches = [
+        (i, entry) for i, entry in enumerate(entries)
+        if keyword_lower in (entry.get('title') or '').lower()
+    ]
+
+    if not matches:
+        print('[!] "%s"이(가) 포함된 곡을 찾을 수 없습니다. 원래 순서를 사용합니다.' % keyword)
+        return entries
+
+    if len(matches) == 1:
+        index, entry = matches[0]
+        print('[*] 선택된 곡: %s' % (entry.get('title') or entry.get('id') or 'unknown'))
+    else:
+        print('[*] "%s"이(가) 포함된 곡이 여러 개 있습니다:' % keyword)
+        for n, (i, entry) in enumerate(matches, start=1):
+            print('  %d) %s' % (n, entry.get('title') or entry.get('id') or 'unknown'))
+
+        choice = input('번호를 선택하세요 (건너뛰려면 Enter): ').strip()
+        if not choice:
+            return entries
+
+        try:
+            pick = int(choice) - 1
+        except ValueError:
+            print('[!] 잘못된 입력입니다. 원래 순서를 사용합니다.')
+            return entries
+
+        if pick < 0 or pick >= len(matches):
+            print('[!] 범위를 벗어난 번호입니다. 원래 순서를 사용합니다.')
+            return entries
+
+        index, entry = matches[pick]
+
+    reordered = [entries[index]] + entries[:index] + entries[index + 1:]
+    return reordered
+
+def download_playlist_merged(playlist_title, entries, skip_start_sec=0.0, skip_end_sec=0.0):
     '''플레이리스트의 각 영상을 무음 트림한 뒤 하나의 MP3로 이어붙인다.'''
     merged = AudioSegment.empty()
     success_count = 0
 
     for entry in tqdm(entries):
         try:
-            title, trimmed_sound = download_and_trim(entry)
+            title, trimmed_sound = download_and_trim(entry, skip_start_sec, skip_end_sec)
             merged += trimmed_sound
             success_count += 1
             print('[+] 병합에 추가: %s' % title)
@@ -146,14 +217,17 @@ if is_playlist:
     print('  1) 각각 파일로 받기')
     print('  2) 전부 이어서 하나의 파일로 받기')
     mode = input('선택 (1/2): ').strip()
+    skip_start_sec, skip_end_sec = ask_trim_seconds()
 
     if mode == '2':
-        download_playlist_merged(title, entries)
+        entries = choose_first_entry(entries)
+        download_playlist_merged(title, entries, skip_start_sec, skip_end_sec)
     else:
         for entry in tqdm(entries):
-            download_and_convert(entry)
+            download_and_convert(entry, skip_start_sec, skip_end_sec)
 else:
     print('[*] 단일 영상 다운로드: "%s"' % title)
-    download_and_convert(entries[0])
+    skip_start_sec, skip_end_sec = ask_trim_seconds()
+    download_and_convert(entries[0], skip_start_sec, skip_end_sec)
 
 print('[*] 완료!')
