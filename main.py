@@ -1,4 +1,7 @@
 import os
+import shutil
+import subprocess
+import tempfile
 import yt_dlp
 from pydub import AudioSegment
 from tqdm import tqdm
@@ -177,30 +180,61 @@ def choose_first_entry(entries):
     reordered = [entries[index]] + entries[:index] + entries[index + 1:]
     return reordered
 
+def concat_with_ffmpeg(segment_paths, output_path):
+    '''ffmpeg concat demuxer로 여러 WAV 파일을 하나의 MP3로 이어붙인다.
+
+    pydub는 내보내기 전 파이썬 wave 모듈로 임시 WAV 헤더를 쓰는데,
+    이 헤더의 크기 필드가 32비트(약 4GB)까지만 지원해 긴 플레이리스트를
+    한 번에 병합하면 struct.error가 발생한다. ffmpeg concat demuxer는
+    이 제한 없이 스트리밍 방식으로 이어붙인다.
+    '''
+    list_path = output_path + '.txt'
+    with open(list_path, 'w', encoding='utf-8') as f:
+        for path in segment_paths:
+            escaped = os.path.abspath(path).replace("'", "'\\''")
+            f.write("file '%s'\n" % escaped)
+
+    try:
+        subprocess.run(
+            ['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path,
+             '-c:a', 'libmp3lame', '-b:a', '192k', output_path],
+            check=True,
+            stdout=subprocess.DEVNULL if not verbose else None,
+            stderr=subprocess.DEVNULL if not verbose else None,
+        )
+    finally:
+        os.remove(list_path)
+
 def download_playlist_merged(playlist_title, entries, skip_start_sec=0.0, skip_end_sec=0.0):
     '''플레이리스트의 각 영상을 무음 트림한 뒤 하나의 MP3로 이어붙인다.'''
-    merged = AudioSegment.empty()
-    success_count = 0
+    temp_dir = tempfile.mkdtemp(prefix='playlist_merge_')
+    segment_paths = []
+    total_ms = 0
 
-    for entry in tqdm(entries):
-        try:
-            title, trimmed_sound = download_and_trim(entry, skip_start_sec, skip_end_sec)
-            merged += trimmed_sound
-            success_count += 1
-            print('[+] 병합에 추가: %s' % title)
-        except Exception as e:
-            print('[!] 오류 발생: %s - %s' % (entry.get('title', 'unknown'), e))
+    try:
+        for i, entry in enumerate(tqdm(entries)):
+            try:
+                title, trimmed_sound = download_and_trim(entry, skip_start_sec, skip_end_sec)
+                segment_path = os.path.join(temp_dir, '%04d.wav' % i)
+                trimmed_sound.export(segment_path, format='wav')
+                segment_paths.append(segment_path)
+                total_ms += len(trimmed_sound)
+                print('[+] 병합에 추가: %s' % title)
+            except Exception as e:
+                print('[!] 오류 발생: %s - %s' % (entry.get('title', 'unknown'), e))
 
-    if success_count == 0:
-        print('[!] 병합할 영상이 없습니다.')
-        return False
+        if not segment_paths:
+            print('[!] 병합할 영상이 없습니다.')
+            return False
 
-    output_name = sanitize_filename(playlist_title) or 'playlist'
-    mp3_path = os.path.join(mp3_dir, output_name + '.mp3')
-    merged.export(mp3_path, format='mp3', bitrate='192k')
-    duration_min = len(merged) / 1000 / 60
-    print('[+] 하나로 이어붙여 저장: %s (%d개 영상, %.1f분)' % (mp3_path, success_count, duration_min))
-    return True
+        output_name = sanitize_filename(playlist_title) or 'playlist'
+        mp3_path = os.path.join(mp3_dir, output_name + '.mp3')
+        concat_with_ffmpeg(segment_paths, mp3_path)
+        duration_min = total_ms / 1000 / 60
+        print('[+] 하나로 이어붙여 저장: %s (%d개 영상, %.1f분)' % (mp3_path, len(segment_paths), duration_min))
+        return True
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 os.makedirs(webm_dir, exist_ok=True)
 os.makedirs(mp3_dir, exist_ok=True)
